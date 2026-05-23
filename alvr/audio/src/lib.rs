@@ -1,609 +1,635 @@
-#![allow(clippy::if_same_then_else)]
+#[cfg(windows)]
+mod windows;
 
-use crate::{
-    logging_backend::{LogMirrorData, LOG_CHANNEL_SENDER},
-    sockets::AnnouncerSocket,
-    statistics::StatisticsManager,
-    storage::Config,
-    ClientCapabilities, ClientCoreEvent,
-};
-use alvr_audio::AudioDevice;
+#[cfg(target_os = "linux")]
+pub mod linux;
+
+#[cfg(windows)]
+pub use crate::windows::*;
+
 use alvr_common::{
-    dbg_connection, debug, error, info,
-    parking_lot::{Condvar, Mutex, RwLock},
-    wait_rwlock, warn, AnyhowToCon, ConResult, ConnectionError, ConnectionState, LifecycleState,
-    Pose, RelaxedAtomic, ViewParams, ALVR_VERSION,
+    anyhow::{self, anyhow, bail, Context, Result},
+    info,
+    once_cell::sync::Lazy,
+    parking_lot::Mutex,
+    ConnectionError, ToAny,
 };
-use alvr_packets::{
-    ClientConnectionResult, ClientControlPacket, ClientStatistics, Haptics, RealTimeConfig,
-    ServerControlPacket, StreamConfigPacket, Tracking, VideoPacketHeader,
-    VideoStreamingCapabilities, AUDIO, HAPTICS, STATISTICS, TRACKING, VIDEO,
+use alvr_session::{AudioBufferingConfig, CustomAudioDeviceConfig, MicrophoneDevicesConfig};
+use alvr_sockets::{StreamReceiver, StreamSender};
+use cpal::{
+    traits::{DeviceTrait, HostTrait, StreamTrait},
+    BufferSize, Device, Host, Sample, SampleFormat, StreamConfig,
 };
-use alvr_session::{audio::AudioBufferingConfig, SocketProtocol};
-use alvr_sockets::{
-    ControlSocketSender, PeerType, ProtoControlSocket, StreamSender, StreamSocketBuilder,
-    KEEPALIVE_INTERVAL, KEEPALIVE_TIMEOUT,
-};
+use rodio::{OutputStream, Source};
 use std::{
-    collections::VecDeque,
-    sync::{mpsc, Arc},
+    collections::{HashMap, VecDeque},
+    sync::Arc,
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
-#[cfg(target_os = "android")]
-use crate::audio;
-#[cfg(not(target_os = "android"))]
-use alvr_audio as audio;
+static VIRTUAL_MICROPHONE_PAIRS: Lazy<HashMap<&str, &str>> = Lazy::new(|| {
+    [
+        ("Line 1", "Line 1"),
+        ("CABLE Input", "CABLE Output"),
+        ("VoiceMeeter Input", "VoiceMeeter Output"),
+        ("VoiceMeeter Aux Input", "VoiceMeeter Aux Output"),
+        ("VoiceMeeter VAIO3 Input", "VoiceMeeter VAIO3 Output"),
+    ]
+    .into_iter()
+    .collect()
+});
 
-const INITIAL_MESSAGE: &str = concat!(
-    "Searching for streamer...\n",
-    "Open ALVR on your PC then click \"Trust\"\n",
-    "next to the device entry",
-);
-const NETWORK_UNREACHABLE_MESSAGE: &str = "Cannot connect to the streamer.\nNetwork error.";
-const SUCCESS_CONNECT_MESSAGE: &str = "Successful connection!\nPlease wait...";
-const LOCAL_TRY_MESSAGE: &str = "Trying to connect to localhost...";
+fn device_from_custom_config(
+    host: &Host,
+    config: &CustomAudioDeviceConfig,
+    is_output: bool,
+) -> Result<Device> {
+    let mut devices = if is_output {
+        host.output_devices()?
+    } else {
+        host.input_devices()?
+    };
 
-const STREAM_STARTING_MESSAGE: &str = "The stream will begin soon\nPlease wait...";
-const SERVER_RESTART_MESSAGE: &str = "The streamer is restarting\nPlease wait...";
-const SERVER_DISCONNECTED_MESSAGE: &str = "The streamer has disconnected.";
-const CONNECTION_TIMEOUT_MESSAGE: &str = "Connection timeout.";
-
-const DISCOVERY_RETRY_PAUSE: Duration = Duration::from_millis(500);
-const RETRY_CONNECT_MIN_INTERVAL: Duration = Duration::from_secs(1);
-const CONNECTION_RETRY_INTERVAL: Duration = Duration::from_secs(1);
-const HANDSHAKE_ACTION_TIMEOUT: Duration = Duration::from_secs(2);
-const STREAMING_RECV_TIMEOUT: Duration = Duration::from_millis(500);
-
-const MAX_UNREAD_PACKETS: usize = 10; // Applies per stream
-
-pub type DecoderCallback = dyn FnMut(Duration, &[u8]) -> bool + Send;
-
-#[derive(Default)]
-pub struct ConnectionContext {
-    pub state: RwLock<ConnectionState>,
-    pub disconnected_notif: Condvar,
-    pub control_sender: Mutex<Option<ControlSocketSender<ClientControlPacket>>>,
-    pub tracking_sender: Mutex<Option<StreamSender<Tracking>>>,
-    pub statistics_sender: Mutex<Option<StreamSender<ClientStatistics>>>,
-    pub statistics_manager: Mutex<Option<StatisticsManager>>,
-    pub decoder_callback: Mutex<Option<Box<DecoderCallback>>>,
-    pub head_pose_queue: RwLock<VecDeque<(Duration, Pose)>>,
-    pub last_good_head_pose: RwLock<Pose>,
-    pub view_params: RwLock<[ViewParams; 2]>,
-    pub uses_multimodal_protocol: RelaxedAtomic,
-    pub velocities_multiplier: RwLock<f32>,
-    pub max_prediction: RwLock<Duration>,
+    Ok(match config {
+        CustomAudioDeviceConfig::NameSubstring(name_substring) => devices
+            .find(|d| {
+                d.name()
+                    .map(|name| name.to_lowercase().contains(&name_substring.to_lowercase()))
+                    .unwrap_or(false)
+            })
+            .with_context(|| {
+                format!("Cannot find audio device which name contains \"{name_substring}\"")
+            })?,
+        CustomAudioDeviceConfig::Index(index) => devices
+            .nth(*index)
+            .with_context(|| format!("Cannot find audio device at index {index}"))?,
+    })
 }
 
-fn set_hud_message(event_queue: &Mutex<VecDeque<ClientCoreEvent>>, message: &str) {
-    let message = format!(
-        "ALVR v{}\nhostname: {}\nIP: {}\n\n{message}",
-        *ALVR_VERSION,
-        Config::load().hostname,
-        alvr_system_info::local_ip(),
-    );
+// Input and output devices may have the same name.
+fn microphone_pair_from_sink_name(host: &Host, sink_name: &str) -> Result<(Device, Device)> {
+    let sink = host
+        .output_devices()?
+        .find(|d| d.name().unwrap_or_default().contains(sink_name))
+        .context("Virtual Audio Cable, VB-CABLE or VoiceMeeter not found. Please install or reinstall one")?;
 
-    event_queue
-        .lock()
-        .push_back(ClientCoreEvent::UpdateHudMessage(message));
+    if let Some(source_name) = VIRTUAL_MICROPHONE_PAIRS.get(sink_name) {
+        Ok((
+            sink,
+            host.input_devices()?
+                .find(|d| d.name().unwrap_or_default().contains(source_name))
+                .context("Matching output microphone not found. Did you rename it?")?,
+        ))
+    } else {
+        unreachable!("Invalid argument")
+    }
 }
 
-fn is_streaming(ctx: &ConnectionContext) -> bool {
-    *ctx.state.read() == ConnectionState::Streaming
+#[allow(dead_code)]
+pub struct AudioDevice {
+    inner: Device,
+    is_output: bool,
 }
 
-pub fn connection_lifecycle_loop(
-    capabilities: ClientCapabilities,
-    ctx: Arc<ConnectionContext>,
-    lifecycle_state: Arc<RwLock<LifecycleState>>,
-    event_queue: Arc<Mutex<VecDeque<ClientCoreEvent>>>,
-) {
-    dbg_connection!("connection_lifecycle_loop: Begin");
+#[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+impl AudioDevice {
+    pub fn new_output(config: Option<&CustomAudioDeviceConfig>) -> Result<Self> {
+        let host = cpal::default_host();
 
-    set_hud_message(&event_queue, INITIAL_MESSAGE);
+        let device = match config {
+            None => host
+                .default_output_device()
+                .context("No output audio device found")?,
+            Some(config) => device_from_custom_config(&host, config, true)?,
+        };
 
-    while *lifecycle_state.read() != LifecycleState::ShuttingDown {
-        if *lifecycle_state.read() == LifecycleState::Resumed {
-            if let Err(e) = connection_pipeline(
-                capabilities.clone(),
-                Arc::clone(&ctx),
-                Arc::clone(&lifecycle_state),
-                Arc::clone(&event_queue),
-            ) {
-                let message = format!("Connection error:\n{e}\nCheck the PC for more details");
-                set_hud_message(&event_queue, &message);
-                error!("Connection error: {e}");
-            }
-        } else {
-            debug!("Skip try connection because the device is sleeping");
-        }
-
-        *ctx.state.write() = ConnectionState::Disconnected;
-        ctx.disconnected_notif.notify_all();
-
-        thread::sleep(CONNECTION_RETRY_INTERVAL);
+        Ok(Self {
+            inner: device,
+            is_output: true,
+        })
     }
 
-    dbg_connection!("connection_lifecycle_loop: End");
-}
+    pub fn new_input(config: Option<CustomAudioDeviceConfig>) -> Result<Self> {
+        let host = cpal::default_host();
 
-fn connection_pipeline(
-    capabilities: ClientCapabilities,
-    ctx: Arc<ConnectionContext>,
-    lifecycle_state: Arc<RwLock<LifecycleState>>,
-    event_queue: Arc<Mutex<VecDeque<ClientCoreEvent>>>,
-) -> ConResult {
-    dbg_connection!("connection_pipeline: Begin");
+        let device = match config {
+            None => host
+                .default_input_device()
+                .context("No input audio device found")?,
+            Some(config) => device_from_custom_config(&host, &config, false)?,
+        };
 
-    let (mut proto_control_socket, server_ip) = {
-        let config = Config::load();
-        let announcer_socket = AnnouncerSocket::new(&config.hostname).to_con()?;
-        let listener_socket =
-            alvr_sockets::get_server_listener(HANDSHAKE_ACTION_TIMEOUT).to_con()?;
-
-        loop {
-            if *lifecycle_state.read() != LifecycleState::Resumed {
-                return Ok(());
-            }
-
-            let mut is_broadcast_ok = false;
-            if let Err(e) = announcer_socket.announce_broadcast() {
-                debug!("Couldn't announce to localhost, retrying on local... {e:}");
-
-                set_hud_message(&event_queue, LOCAL_TRY_MESSAGE);
-            } else {
-                is_broadcast_ok = true;
-            }
-
-            if let Ok(pair) = ProtoControlSocket::connect_to(
-                DISCOVERY_RETRY_PAUSE,
-                PeerType::Server(&listener_socket),
-            ) {
-                set_hud_message(&event_queue, SUCCESS_CONNECT_MESSAGE);
-                break pair;
-            }
-
-            if !is_broadcast_ok {
-                warn!("Couldn't announce to network or connect to localhost.");
-                set_hud_message(&event_queue, NETWORK_UNREACHABLE_MESSAGE);
-
-                thread::sleep(RETRY_CONNECT_MIN_INTERVAL);
-
-                set_hud_message(&event_queue, INITIAL_MESSAGE);
-                return Ok(());
-            }
-        }
-    };
-
-    let mut connection_state_lock = ctx.state.write();
-    let disconnect_notif = Arc::new(Condvar::new());
-
-    *connection_state_lock = ConnectionState::Connecting;
-
-    let microphone_sample_rate = AudioDevice::new_input(None)
-        .to_con()?
-        .input_sample_rate()
-        .to_con()?;
-
-    dbg_connection!("connection_pipeline: Send stream capabilities");
-    proto_control_socket
-        .send(&ClientConnectionResult::ConnectionAccepted {
-            client_protocol_id: alvr_common::protocol_id_u64(),
-            display_name: alvr_system_info::platform().to_string(),
-            server_ip,
-            streaming_capabilities: Some(
-                alvr_packets::encode_video_streaming_capabilities(&VideoStreamingCapabilities {
-                    default_view_resolution: capabilities.default_view_resolution,
-                    supported_refresh_rates: capabilities.refresh_rates,
-                    microphone_sample_rate,
-                    supports_foveated_encoding: capabilities.foveated_encoding,
-                    encoder_high_profile: capabilities.encoder_high_profile,
-                    encoder_10_bits: capabilities.encoder_10_bits,
-                    encoder_av1: capabilities.encoder_av1,
-                    multimodal_protocol: true,
-                    prefer_10bit: capabilities.prefer_10bit,
-                    prefer_full_range: capabilities.prefer_full_range,
-                    preferred_encoding_gamma: capabilities.preferred_encoding_gamma,
-                    prefer_hdr: capabilities.prefer_hdr,
-                })
-                .to_con()?,
-            ),
+        Ok(Self {
+            inner: device,
+            is_output: false,
         })
-        .to_con()?;
-    let config_packet =
-        proto_control_socket.recv::<StreamConfigPacket>(HANDSHAKE_ACTION_TIMEOUT)?;
-    dbg_connection!("connection_pipeline: stream config received");
-
-    let stream_config = alvr_packets::decode_stream_config(&config_packet).to_con()?;
-
-    ctx.uses_multimodal_protocol
-        .set(stream_config.negotiated_config.use_multimodal_protocol);
-
-    let streaming_start_event = ClientCoreEvent::StreamingStarted(Box::new(stream_config.clone()));
-
-    let settings = stream_config.settings;
-    let negotiated_config = stream_config.negotiated_config;
-
-    *ctx.velocities_multiplier.write() = settings.extra.velocities_multiplier;
-    *ctx.max_prediction.write() = Duration::from_millis(settings.headset.max_prediction_ms);
-
-    *ctx.statistics_manager.lock() = Some(StatisticsManager::new(
-        settings.connection.statistics_history_size,
-        Duration::from_secs_f32(1.0 / negotiated_config.refresh_rate_hint),
-        if let Some(config) = settings.headset.controllers.as_option() {
-            config.steamvr_pipeline_frames
-        } else {
-            0.0
-        },
-    ));
-
-    let (mut control_sender, mut control_receiver) = proto_control_socket
-        .split(STREAMING_RECV_TIMEOUT)
-        .to_con()?;
-
-    match control_receiver.recv(HANDSHAKE_ACTION_TIMEOUT) {
-        Ok(ServerControlPacket::StartStream) => {
-            info!("Stream starting");
-            set_hud_message(&event_queue, STREAM_STARTING_MESSAGE);
-        }
-        Ok(ServerControlPacket::Restarting) => {
-            info!("Server restarting");
-            set_hud_message(&event_queue, SERVER_RESTART_MESSAGE);
-            return Ok(());
-        }
-        Err(e) => {
-            info!("Server disconnected. Cause: {e}");
-            set_hud_message(&event_queue, SERVER_DISCONNECTED_MESSAGE);
-            return Ok(());
-        }
-        _ => {
-            info!("Unexpected packet");
-            set_hud_message(&event_queue, "Unexpected packet");
-            return Ok(());
-        }
     }
 
-    let stream_protocol = if negotiated_config.wired {
-        SocketProtocol::Tcp
-    } else {
-        settings.connection.stream_protocol
-    };
+    // returns (sink, source)
+    pub fn new_virtual_microphone_pair(config: MicrophoneDevicesConfig) -> Result<(Self, Self)> {
+        let host = cpal::default_host();
 
-    dbg_connection!("connection_pipeline: create StreamSocket");
-    let stream_socket_builder = StreamSocketBuilder::listen_for_server(
-        Duration::from_secs(1),
-        settings.connection.stream_port,
-        stream_protocol,
-        settings.connection.dscp,
-        settings.connection.client_send_buffer_bytes,
-        settings.connection.client_recv_buffer_bytes,
-    )
-    .to_con()?;
-
-    dbg_connection!("connection_pipeline: Send StreamReady");
-    if let Err(e) = control_sender.send(&ClientControlPacket::StreamReady) {
-        info!("Server disconnected. Cause: {e:?}");
-        set_hud_message(&event_queue, SERVER_DISCONNECTED_MESSAGE);
-        return Ok(());
-    }
-
-    dbg_connection!("connection_pipeline: accept connection");
-    let mut stream_socket = stream_socket_builder.accept_from_server(
-        server_ip,
-        settings.connection.stream_port,
-        settings.connection.packet_size as _,
-        HANDSHAKE_ACTION_TIMEOUT,
-    )?;
-
-    info!("Connected to server");
-
-    let mut video_receiver =
-        stream_socket.subscribe_to_stream::<VideoPacketHeader>(VIDEO, MAX_UNREAD_PACKETS);
-    let mut game_audio_receiver = stream_socket.subscribe_to_stream(AUDIO, MAX_UNREAD_PACKETS);
-    let tracking_sender = stream_socket.request_stream(TRACKING);
-    let mut haptics_receiver =
-        stream_socket.subscribe_to_stream::<Haptics>(HAPTICS, MAX_UNREAD_PACKETS);
-    let statistics_sender = stream_socket.request_stream(STATISTICS);
-
-    let video_receive_thread = thread::spawn({
-        let ctx = Arc::clone(&ctx);
-        move || {
-            let mut stream_corrupted = true;
-            while is_streaming(&ctx) {
-                let data = match video_receiver.recv(STREAMING_RECV_TIMEOUT) {
-                    Ok(data) => data,
-                    Err(ConnectionError::TryAgain(_)) => continue,
-                    Err(ConnectionError::Other(_)) => return,
-                };
-                let Ok((header, nal)) = data.get() else {
-                    return;
-                };
-
-                if let Some(stats) = &mut *ctx.statistics_manager.lock() {
-                    stats.report_video_packet_received(header.timestamp);
-                }
-
-                if header.is_idr {
-                    stream_corrupted = false;
-                } else if data.had_packet_loss() {
-                    stream_corrupted = true;
-                    if let Some(sender) = &mut *ctx.control_sender.lock() {
-                        sender.send(&ClientControlPacket::RequestIdr).ok();
-                    }
-                    warn!("Network dropped video packet");
-                }
-
-                if !stream_corrupted || !settings.connection.avoid_video_glitching {
-                    let submitted = ctx
-                        .decoder_callback
-                        .lock()
-                        .as_mut()
-                        .is_some_and(|callback| callback(header.timestamp, nal));
-
-                    if !submitted {
-                        stream_corrupted = true;
-                        if let Some(sender) = &mut *ctx.control_sender.lock() {
-                            sender.send(&ClientControlPacket::RequestIdr).ok();
-                        }
-                        warn!("Dropped video packet. Reason: Decoder saturation")
-                    }
-                } else {
-                    if let Some(sender) = &mut *ctx.control_sender.lock() {
-                        sender.send(&ClientControlPacket::RequestIdr).ok();
-                    }
-                    warn!("Dropped video packet. Reason: Waiting for IDR frame")
-                }
-            }
-        }
-    });
-
-    let game_audio_thread = if let Some(config) = settings.audio.game_audio.as_option() {
-        let device = AudioDevice::new_output(None).to_con()?;
-        thread::spawn({
-            let ctx = Arc::clone(&ctx);
-            let config_buffering = config.buffering.clone();
-            move || {
-                while is_streaming(&ctx) {
-                    alvr_common::show_err(audio::play_audio_loop(
-                        || is_streaming(&ctx),
-                        &device,
-                        2,
-                        negotiated_config.game_audio_sample_rate,
-                        config_buffering.clone(),
-                        &mut game_audio_receiver,
-                    ));
-                }
-            }
-        })
-    } else {
-        thread::spawn(|| ())
-    };
-
-    let (log_channel_sender, log_channel_receiver) = mpsc::channel();
-
-    let microphone_thread = if settings.audio.microphone.enabled() {
-        let device = AudioDevice::new_input(None).to_con()?;
-
-        let microphone_sender = stream_socket.request_stream(AUDIO);
-
-        thread::spawn({
-            let ctx = Arc::clone(&ctx);
-            move || {
-                while is_streaming(&ctx) {
-                    let ctx = Arc::clone(&ctx);
-                    match audio::record_audio_blocking(
-                        Arc::new(move || is_streaming(&ctx)),
-                        microphone_sender.clone(),
-                        &device,
-                        1,
-                        false,
-                    ) {
-                        Ok(()) => break,
-                        Err(e) => {
-                            error!("Audio record error: {e}");
-
-                            continue;
-                        }
-                    }
-                }
-            }
-        })
-    } else {
-        thread::spawn(|| ())
-    };
-
-    let haptics_receive_thread = thread::spawn({
-        let ctx = Arc::clone(&ctx);
-        let event_queue = Arc::clone(&event_queue);
-        move || {
-            while is_streaming(&ctx) {
-                let data = match haptics_receiver.recv(STREAMING_RECV_TIMEOUT) {
-                    Ok(packet) => packet,
-                    Err(ConnectionError::TryAgain(_)) => continue,
-                    Err(ConnectionError::Other(_)) => return,
-                };
-                let Ok(haptics) = data.get_header() else {
-                    return;
-                };
-
-                event_queue.lock().push_back(ClientCoreEvent::Haptics {
-                    device_id: haptics.device_id,
-                    duration: haptics.duration,
-                    frequency: haptics.frequency,
-                    amplitude: haptics.amplitude,
-                });
-            }
-        }
-    });
-
-    let control_send_thread = thread::spawn({
-        let ctx = Arc::clone(&ctx);
-        let event_queue = Arc::clone(&event_queue);
-        let disconnect_notif = Arc::clone(&disconnect_notif);
-        move || {
-            let mut keepalive_deadline = Instant::now();
-
-            #[cfg(target_os = "android")]
-            let mut battery_deadline = Instant::now();
-
-            while is_streaming(&ctx) && *lifecycle_state.read() == LifecycleState::Resumed {
-                // Shorter non-blocking check of 20ms to allow keepalive checks to run with high precision
-                if let (Ok(packet), Some(sender)) = (
-                    log_channel_receiver.recv_timeout(Duration::from_millis(20)),
-                    &mut *ctx.control_sender.lock(),
-                ) {
-                    if let Err(e) = sender.send(&packet) {
-                        info!("Server disconnected. Cause: {e:?}");
-                        set_hud_message(&event_queue, SERVER_DISCONNECTED_MESSAGE);
-
+        let (sink, source) = match config {
+            MicrophoneDevicesConfig::Automatic => {
+                let mut pair = Err(anyhow!("No microphones found"));
+                for sink_name in VIRTUAL_MICROPHONE_PAIRS.keys() {
+                    pair = microphone_pair_from_sink_name(&host, sink_name);
+                    if pair.is_ok() {
                         break;
                     }
                 }
 
-                if Instant::now() > keepalive_deadline {
-                    if let Some(sender) = &mut *ctx.control_sender.lock() {
-                        sender.send(&ClientControlPacket::KeepAlive).ok();
-
-                        keepalive_deadline = Instant::now() + KEEPALIVE_INTERVAL;
-                    }
-                }
-
-                #[cfg(target_os = "android")]
-                if Instant::now() > battery_deadline {
-                    let (gauge_value, is_plugged) = alvr_system_info::get_battery_status();
-                    if let Some(sender) = &mut *ctx.control_sender.lock() {
-                        sender
-                            .send(&ClientControlPacket::Battery(crate::BatteryInfo {
-                                device_id: *alvr_common::HEAD_ID,
-                                gauge_value,
-                                is_plugged,
-                            }))
-                            .ok();
-                    }
-
-                    battery_deadline = Instant::now() + Duration::from_secs(5);
-                }
+                pair?
             }
-
-            disconnect_notif.notify_one();
-        }
-    });
-
-    let control_receive_thread = thread::spawn({
-        let ctx = Arc::clone(&ctx);
-        let event_queue = Arc::clone(&event_queue);
-        let disconnect_notif = Arc::clone(&disconnect_notif);
-        move || {
-            let mut disconnection_deadline = Instant::now() + KEEPALIVE_TIMEOUT;
-            while is_streaming(&ctx) {
-                let maybe_packet = control_receiver.recv(STREAMING_RECV_TIMEOUT);
-
-                match maybe_packet {
-                    Ok(ServerControlPacket::DecoderConfig(config)) => {
-                        event_queue
-                            .lock()
-                            .push_back(ClientCoreEvent::DecoderConfig {
-                                codec: config.codec,
-                                config_nal: config.config_buffer,
-                            });
-                    }
-                    Ok(ServerControlPacket::Restarting) => {
-                        info!("{SERVER_RESTART_MESSAGE}");
-                        set_hud_message(&event_queue, SERVER_RESTART_MESSAGE);
-                        disconnect_notif.notify_one();
-                    }
-                    Ok(ServerControlPacket::ReservedBuffer(buffer)) => {
-                        if let Ok(config) = RealTimeConfig::decode(&buffer) {
-                            event_queue
-                                .lock()
-                                .push_back(ClientCoreEvent::RealTimeConfig(config));
-                        }
-                    }
-                    Ok(_) => (),
-                    Err(ConnectionError::TryAgain(_)) => {
-                        if Instant::now() > disconnection_deadline {
-                            info!("{CONNECTION_TIMEOUT_MESSAGE}");
-                            set_hud_message(&event_queue, CONNECTION_TIMEOUT_MESSAGE);
-                            disconnect_notif.notify_one();
-                        } else {
-                            continue;
-                        }
-                    }
-                    Err(e) => {
-                        info!("{SERVER_DISCONNECTED_MESSAGE} Cause: {e}");
-                        set_hud_message(&event_queue, SERVER_DISCONNECTED_MESSAGE);
-                        disconnect_notif.notify_one();
-                    }
-                }
-
-                disconnection_deadline = Instant::now() + KEEPALIVE_TIMEOUT;
+            MicrophoneDevicesConfig::VAC => microphone_pair_from_sink_name(&host, "Line 1")?,
+            MicrophoneDevicesConfig::VBCable => {
+                microphone_pair_from_sink_name(&host, "CABLE Input")?
             }
-        }
-    });
-
-    let stream_receive_thread = thread::spawn({
-        let ctx = Arc::clone(&ctx);
-        let event_queue = Arc::clone(&event_queue);
-        let disconnect_notif = Arc::clone(&disconnect_notif);
-        move || {
-            while is_streaming(&ctx) {
-                match stream_socket.recv() {
-                    Ok(()) => (),
-                    Err(ConnectionError::TryAgain(_)) => continue,
-                    Err(e) => {
-                        info!("Client disconnected. Cause: {e}");
-                        set_hud_message(&event_queue, SERVER_DISCONNECTED_MESSAGE);
-                        disconnect_notif.notify_one();
-                    }
-                }
+            MicrophoneDevicesConfig::VoiceMeeter => {
+                microphone_pair_from_sink_name(&host, "VoiceMeeter Input")?
             }
-        }
-    });
+            MicrophoneDevicesConfig::VoiceMeeterAux => {
+                microphone_pair_from_sink_name(&host, "VoiceMeeter Aux Input")?
+            }
+            MicrophoneDevicesConfig::VoiceMeeterVaio3 => {
+                microphone_pair_from_sink_name(&host, "VoiceMeeter VAIO3 Input")?
+            }
+            MicrophoneDevicesConfig::Custom { sink, source } => (
+                device_from_custom_config(&host, &sink, true)?,
+                device_from_custom_config(&host, &source, false)?,
+            ),
+        };
 
-    *ctx.control_sender.lock() = Some(control_sender);
-    *ctx.tracking_sender.lock() = Some(tracking_sender);
-    *ctx.statistics_sender.lock() = Some(statistics_sender);
-    if let Some(config) = settings.extra.logging.client_log_report_level.as_option() {
-        *LOG_CHANNEL_SENDER.lock() = Some(LogMirrorData {
-            sender: log_channel_sender,
-            filter_level: *config,
-            debug_groups_config: settings.extra.logging.debug_groups,
-        });
+        Ok((
+            Self {
+                inner: sink,
+                is_output: true,
+            },
+            Self {
+                inner: source,
+                is_output: false,
+            },
+        ))
     }
-    event_queue.lock().push_back(streaming_start_event);
 
-    *connection_state_lock = ConnectionState::Streaming;
+    pub fn input_sample_rate(&self) -> Result<u32> {
+        let config = self
+            .inner
+            .default_input_config()
+            // On Windows, loopback devices are not recognized as input devices. Use output config.
+            .or_else(|_| self.inner.default_output_config())?;
 
-    dbg_connection!("connection_pipeline: Unlock streams");
+        Ok(config.sample_rate().0)
+    }
+}
 
-    wait_rwlock(&disconnect_notif, &mut connection_state_lock);
+pub fn is_same_device(device1: &AudioDevice, device2: &AudioDevice) -> bool {
+    if let (Ok(name1), Ok(name2)) = (device1.inner.name(), device2.inner.name()) {
+        name1 == name2 && device1.is_output == device2.is_output
+    } else {
+        false
+    }
+}
 
-    *connection_state_lock = ConnectionState::Disconnecting;
+pub enum AudioRecordState {
+    Recording,
+    ShouldStop,
+    Err(Option<anyhow::Error>),
+}
 
-    *ctx.control_sender.lock() = None;
-    *ctx.tracking_sender.lock() = None;
-    *ctx.statistics_sender.lock() = None;
-    *LOG_CHANNEL_SENDER.lock() = None;
+pub enum AudioChannel {
+    FrontLeft,
+    FrontRight,
+    Center,
+    SurroundLeft,
+    SurroundRight,
+    BackLeft,
+    BackRight,
+    Top,
+    HighFrontLeft,
+    HighFrontRight,
+    HighFrontCenter,
+    HighBackLeft,
+    HighBackRight,
+    LowFrequency,
+}
 
-    event_queue
-        .lock()
-        .push_back(ClientCoreEvent::StreamingStopped);
+fn downmix_channels(channels: &[AudioChannel], data: &[u8], out_channels: u16) -> Vec<u8> {
+    let mut left = 0.0;
+    let mut right = 0.0;
 
-    drop(connection_state_lock);
+    for i in 0..channels.len() {
+        let [l, r] = match &channels[i] {
+            AudioChannel::FrontLeft => [1.0, 0.0],
+            AudioChannel::FrontRight => [0.0, 1.0],
+            AudioChannel::Center => [0.707, 0.707],
+            AudioChannel::SurroundLeft => [0.707, 0.0],
+            AudioChannel::SurroundRight => [0.0, 0.707],
+            AudioChannel::BackLeft => [0.707, 0.0],
+            AudioChannel::BackRight => [0.0, 0.707],
+            AudioChannel::Top => [0.577, 0.577],
+            AudioChannel::HighFrontLeft => [0.707, 0.0],
+            AudioChannel::HighFrontRight => [0.0, 0.707],
+            AudioChannel::HighFrontCenter => [0.5, 0.5],
+            AudioChannel::HighBackLeft => [0.5, 0.0],
+            AudioChannel::HighBackRight => [0.0, 0.5],
+            _ => [0.0, 0.0],
+        };
+        let val = i16::from_ne_bytes([data[i * 2], data[i * 2 + 1]]).to_sample::<f32>();
+        left += val * l;
+        right += val * r;
+    }
 
-    dbg_connection!("connection_pipeline: Destroying streams");
+    if out_channels == 1 {
+        let bytes = ((left + right) / 2.0).to_sample::<i16>().to_ne_bytes();
+        vec![bytes[0], bytes[1]]
+    } else {
+        let left_bytes = left.to_sample::<i16>().to_ne_bytes();
+        let right_bytes = right.to_sample::<i16>().to_ne_bytes();
+        vec![left_bytes[0], left_bytes[1], right_bytes[0], right_bytes[1]]
+    }
+}
 
-    video_receive_thread.join().ok();
-    game_audio_thread.join().ok();
-    microphone_thread.join().ok();
-    haptics_receive_thread.join().ok();
-    control_send_thread.join().ok();
-    control_receive_thread.join().ok();
-    stream_receive_thread.join().ok();
+fn downmix_audio(data: Vec<u8>, in_channels: u16, out_channels: u16) -> Vec<u8> {
+    if in_channels == out_channels {
+        data
+    } else if in_channels == 1 && out_channels == 2 {
+        data.chunks_exact(2)
+            .flat_map(|c| vec![c[0], c[1], c[0], c[1]])
+            .collect()
+    } else {
+        let channels = match in_channels {
+            2 => vec![AudioChannel::FrontLeft, AudioChannel::FrontRight],
+            3 => vec![
+                AudioChannel::FrontLeft,
+                AudioChannel::FrontRight,
+                AudioChannel::LowFrequency,
+            ],
+            4 => vec![
+                AudioChannel::FrontLeft,
+                AudioChannel::FrontRight,
+                AudioChannel::BackLeft,
+                AudioChannel::BackRight,
+            ],
+            6 => vec![
+                AudioChannel::FrontRight,
+                AudioChannel::Center,
+                AudioChannel::LowFrequency,
+                AudioChannel::SurroundLeft, // Sometimes actually BackLeft, has same level so it's okay
+                AudioChannel::SurroundRight, // Sometimes actually BackRight, has same level so it's okay
+            ],
+            8 => vec![
+                AudioChannel::FrontLeft,
+                AudioChannel::FrontRight,
+                AudioChannel::Center,
+                AudioChannel::LowFrequency,
+                AudioChannel::BackLeft,
+                AudioChannel::BackRight,
+                AudioChannel::SurroundLeft,
+                AudioChannel::SurroundRight,
+            ],
+            _ => unreachable!("Invalid input channel count"),
+        };
 
-    dbg_connection!("connection_pipeline: End");
+        data.chunks_exact(in_channels as usize * 2)
+            .flat_map(|c| downmix_channels(&channels, c, out_channels))
+            .collect()
+    }
+}
+
+#[allow(unused_variables)]
+pub fn record_audio_blocking(
+    is_running: Arc<dyn Fn() -> bool + Send + Sync>,
+    mut sender: StreamSender<()>,
+    device: &AudioDevice,
+    channels_count: u16,
+    mute: bool,
+) -> Result<()> {
+    let config = device
+        .inner
+        .default_input_config()
+        // On Windows, loopback devices are not recognized as input devices. Use output config.
+        .or_else(|_| device.inner.default_output_config())?;
+
+    if config.channels() > 8 {
+        bail!(
+            "Audio devices with more than 8 channels are not supported. {}",
+            "Please turn off surround audio."
+        );
+    } else if config.channels() == 5 || config.channels() == 7 {
+        bail!(
+            "Audio devices with {} channels are not supported.",
+            config.channels()
+        );
+    }
+
+    let stream_config = StreamConfig {
+        channels: config.channels(),
+        sample_rate: config.sample_rate(),
+        buffer_size: BufferSize::Default,
+    };
+
+    let state = Arc::new(Mutex::new(AudioRecordState::Recording));
+
+    let stream = device.inner.build_input_stream_raw(
+        &stream_config,
+        config.sample_format(),
+        {
+            let state = Arc::clone(&state);
+            let is_running = Arc::clone(&is_running);
+            move |data, _| {
+                let data = if config.sample_format() == SampleFormat::F32 {
+                    data.bytes()
+                        .chunks_exact(4)
+                        .flat_map(|b| {
+                            f32::from_ne_bytes([b[0], b[1], b[2], b[3]])
+                                .to_sample::<i16>()
+                                .to_ne_bytes()
+                                .to_vec()
+                        })
+                        .collect()
+                } else {
+                    data.bytes().to_vec()
+                };
+
+                let data = downmix_audio(data, config.channels(), channels_count);
+
+                if is_running() {
+                    let mut buffer = sender.get_buffer(&()).unwrap();
+                    buffer.get_range_mut(0, data.len()).copy_from_slice(&data);
+                    sender.send(buffer).ok();
+                } else {
+                    *state.lock() = AudioRecordState::ShouldStop;
+                }
+            }
+        },
+        {
+            let state = Arc::clone(&state);
+            move |e| *state.lock() = AudioRecordState::Err(Some(e.into()))
+        },
+        None,
+    )?;
+
+    #[cfg(windows)]
+    if mute && device.is_output {
+        crate::windows::set_mute_windows_device(device, true).ok();
+    }
+
+    let mut res = stream.play().to_any();
+
+    if res.is_ok() {
+        while matches!(*state.lock(), AudioRecordState::Recording) && is_running() {
+            thread::sleep(Duration::from_millis(500))
+        }
+
+        if let AudioRecordState::Err(e) = &mut *state.lock() {
+            res = Err(e.take().unwrap());
+        }
+    }
+
+    #[cfg(windows)]
+    if mute && device.is_output {
+        set_mute_windows_device(device, false).ok();
+    }
+
+    res
+}
+
+// Audio callback. This is designed to be as less complex as possible. Still, when needed, this
+// callback can render a fade-out autonomously.
+#[inline]
+pub fn get_next_frame_batch(
+    sample_buffer: &mut VecDeque<f32>,
+    channels_count: usize,
+    batch_frames_count: usize,
+) -> Vec<f32> {
+    if sample_buffer.len() / channels_count >= batch_frames_count {
+        let mut batch = sample_buffer
+            .drain(0..batch_frames_count * channels_count)
+            .collect::<Vec<_>>();
+
+        if sample_buffer.len() / channels_count < batch_frames_count {
+            // Render fade-out. It is completely contained in the current batch
+            let fade_start = (batch_frames_count as f32 * 0.8) as usize;
+            for f in fade_start..batch_frames_count {
+                let volume = 1.0 - ((f - fade_start) as f32 / (batch_frames_count - fade_start) as f32);
+                for c in 0..channels_count {
+                    batch[f * channels_count + c] *= volume;
+                }
+            }
+        }
+        // fade-ins and cross-fades are rendered in the receive loop directly inside sample_buffer.
+
+        batch
+    } else {
+        vec![0.; batch_frames_count * channels_count]
+    }
+}
+
+// The receive loop is resposible for ensuring smooth transitions in case of disruptions (buffer
+// underflow, overflow, packet loss). In case the computation takes too much time, the audio
+// callback will gracefully handle an interruption, and the callback timing and sound wave
+// continuity will not be affected.
+pub fn receive_samples_loop(
+    is_running: impl Fn() -> bool,
+    receiver: &mut StreamReceiver<()>,
+    sample_buffer: Arc<Mutex<VecDeque<f32>>>,
+    channels_count: usize,
+    batch_frames_count: usize,
+    average_buffer_frames_count: usize,
+) -> Result<()> {
+    let mut recovery_sample_buffer = vec![];
+    
+    // Prevent unbounded memory accumulation during persistent network drops
+    let max_recovery_capacity = (average_buffer_frames_count + batch_frames_count) * channels_count * 3;
+
+    while is_running() {
+        let data = match receiver.recv(Duration::from_millis(500)) {
+            Ok(data) => data,
+            Err(ConnectionError::TryAgain(_)) => continue,
+            Err(ConnectionError::Other(e)) => return Err(e),
+        };
+        let (_, packet) = data.get()?;
+
+        let new_samples = packet
+            .chunks_exact(2)
+            .map(|c| i16::from_ne_bytes([c[0], c[1]]).to_sample::<f32>())
+            .collect::<Vec<_>>();
+
+        let mut sample_buffer_ref = sample_buffer.lock();
+
+        if data.had_packet_loss() {
+            info!("Audio packet loss!");
+
+            if sample_buffer_ref.len() / channels_count < batch_frames_count {
+                sample_buffer_ref.clear();
+            } else {
+                // clear remaining samples
+                sample_buffer_ref.drain(batch_frames_count * channels_count..);
+            }
+
+            recovery_sample_buffer.clear();
+        }
+
+        if sample_buffer_ref.len() / channels_count < batch_frames_count {
+            recovery_sample_buffer.extend(sample_buffer_ref.drain(..));
+        }
+
+        if sample_buffer_ref.is_empty() || data.had_packet_loss() {
+            if recovery_sample_buffer.len() + new_samples.len() <= max_recovery_capacity {
+                recovery_sample_buffer.extend(&new_samples);
+            } else {
+                warn!("Audio recovery buffer overflow, purging oldest samples.");
+                recovery_sample_buffer.drain(0..new_samples.len());
+                recovery_sample_buffer.extend(&new_samples);
+            }
+
+            if recovery_sample_buffer.len() / channels_count
+                > average_buffer_frames_count + batch_frames_count
+            {
+                // Fade-in
+                for f in 0..batch_frames_count {
+                    let volume = f as f32 / batch_frames_count as f32;
+                    for c in 0..channels_count {
+                        recovery_sample_buffer[f * channels_count + c] *= volume;
+                    }
+                }
+
+                if data.had_packet_loss()
+                    && sample_buffer_ref.len() / channels_count == batch_frames_count
+                {
+                    // Add a fade-out to make a cross-fade.
+                    for f in 0..batch_frames_count {
+                        let volume = 1. - f as f32 / batch_frames_count as f32;
+                        for c in 0..channels_count {
+                            recovery_sample_buffer[f * channels_count + c] +=
+                                sample_buffer_ref[f * channels_count + c] * volume;
+                        }
+                    }
+
+                    sample_buffer_ref.clear();
+                }
+
+                sample_buffer_ref.extend(recovery_sample_buffer.drain(..));
+                info!("Audio recovered");
+            }
+        } else {
+            // Discard the recovery accumulator when stable connection resumes to prevent echoes
+            recovery_sample_buffer.clear();
+            sample_buffer_ref.extend(&new_samples);
+        }
+
+        // todo: use smarter policy with EventTiming
+        let buffer_frames_size = sample_buffer_ref.len() / channels_count;
+        if buffer_frames_size > 2 * average_buffer_frames_count + batch_frames_count {
+            info!("Audio buffer overflow! size: {buffer_frames_size}");
+
+            let drained_samples = sample_buffer_ref
+                .drain(0..(buffer_frames_size - average_buffer_frames_count) * channels_count)
+                .collect::<Vec<_>>();
+
+            // Render a cross-fade.
+            for f in 0..batch_frames_count {
+                let volume = f as f32 / batch_frames_count as f32;
+                for c in 0..channels_count {
+                    let index = f * channels_count + c;
+                    sample_buffer_ref[index] = sample_buffer_ref[index]
+                        .mul_add(volume, drained_samples[index] * (1. - volume));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+struct StreamingSource {
+    sample_buffer: Arc<Mutex<VecDeque<f32>>>,
+    current_batch: Vec<f32>,
+    current_batch_cursor: usize,
+    channels_count: usize,
+    sample_rate: u32,
+    batch_frames_count: usize,
+}
+
+impl Source for StreamingSource {
+    fn current_frame_len(&self) -> Option<usize> {
+        None
+    }
+
+    fn channels(&self) -> u16 {
+        self.channels_count as _
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    fn total_duration(&self) -> Option<std::time::Duration> {
+        None
+    }
+}
+
+impl Iterator for StreamingSource {
+    type Item = f32;
+
+    #[inline]
+    fn next(&mut self) -> Option<f32> {
+        if self.current_batch_cursor == 0 {
+            self.current_batch = get_next_frame_batch(
+                &mut self.sample_buffer.lock(),
+                self.channels_count,
+                self.batch_frames_count,
+            );
+        }
+
+        let sample = self.current_batch[self.current_batch_cursor];
+
+        self.current_batch_cursor =
+            (self.current_batch_cursor + 1) % (self.batch_frames_count * self.channels_count);
+
+        Some(sample)
+    }
+}
+
+pub fn play_audio_loop(
+    is_running: impl Fn() -> bool,
+    device: &AudioDevice,
+    channels_count: u16,
+    sample_rate: u32,
+    config: AudioBufferingConfig,
+    receiver: &mut StreamReceiver<()>,
+) -> Result<()> {
+    // Size of a chunk of frames. It corresponds to the duration if a fade-in/out in frames.
+    let batch_frames_count = sample_rate as usize * config.batch_ms as usize / 1000;
+
+    // Average buffer size in frames
+    let average_buffer_frames_count =
+        sample_rate as usize * config.average_buffering_ms as usize / 1000;
+
+    let sample_buffer = Arc::new(Mutex::new(VecDeque::new()));
+
+    let (_stream, handle) = OutputStream::try_from_device(&device.inner)?;
+
+    handle.play_raw(StreamingSource {
+        sample_buffer: Arc::clone(&sample_buffer),
+        current_batch: vec![],
+        current_batch_cursor: 0,
+        channels_count: channels_count as _,
+        sample_rate,
+        batch_frames_count,
+    })?;
+
+    receive_samples_loop(
+        is_running,
+        receiver,
+        sample_buffer,
+        channels_count as _,
+        batch_frames_count,
+        average_buffer_frames_count,
+    )
+    .ok();
 
     Ok(())
 }
