@@ -13,20 +13,20 @@ use windows::{
     },
 };
 
-// RAII guard to manage the lifetime of the COM library on this thread
+// RAII guard to safely manage COM library initialization and uninitialization on the current thread
 struct ComGuard(bool);
 
 impl ComGuard {
     fn new() -> Self {
         unsafe {
-            // Initialize COM as multi-threaded. S_OK or S_FALSE means it succeeded
+            // Initialize COM with multithreaded concurrency. S_OK and S_FALSE represent success
             let hr = Com::CoInitializeEx(None, COINIT_MULTITHREADED);
             Self(hr.is_ok())
         }
     }
 }
 
-// Automatically uninitialize COM when the guard goes out of scope
+// Automatically release COM resources if they were successfully initialized
 impl Drop for ComGuard {
     fn drop(&mut self) {
         if self.0 {
@@ -38,10 +38,9 @@ impl Drop for ComGuard {
 fn get_windows_device(device: &AudioDevice) -> Result<IMMDevice> {
     let device_name = device.inner.name()?;
 
-    // Ensure the device name is not empty
+    // Check preconditions to ensure the device has a valid name
     assert!(!device_name.is_empty());
 
-    // Initialize COM for the duration of this function
     let _com_guard = ComGuard::new();
 
     unsafe {
@@ -51,21 +50,22 @@ fn get_windows_device(device: &AudioDevice) -> Result<IMMDevice> {
         let imm_device_collection =
             imm_device_enumerator.EnumAudioEndpoints(eAll, DEVICE_STATE_ACTIVE)?;
 
-        // Get the total number of audio endpoints
+        // Get the total number of audio endpoints currently active
         let device_count = imm_device_collection.GetCount()?;
+        
+        // Ensure device count is valid and non-negative
         assert!(device_count >= 0);
 
         for i in 0..device_count {
-            // Get the IMMDevice at the current index
             let imm_device = imm_device_collection.Item(i)?;
 
-            // Query the friendly name of the device
+            // Query the friendly name of each endpoint device
             let imm_device_name = imm_device
                 .OpenPropertyStore(STGM_READ)?
                 .GetValue(&PKEY_Device_FriendlyName)?
                 .to_string();
 
-            // Check if the device is configured as an output device
+            // Determine if the endpoint matches our target data flow
             let is_output = imm_device.cast::<IMMEndpoint>()?.GetDataFlow()? == eRender;
 
             if imm_device_name == device_name && device.is_output == is_output {
@@ -78,15 +78,12 @@ fn get_windows_device(device: &AudioDevice) -> Result<IMMDevice> {
 }
 
 pub fn get_windows_device_id(device: &AudioDevice) -> Result<String> {
-    // Verify the device name is valid before querying its ID
     assert!(device.inner.name().is_ok());
 
     unsafe {
         let imm_device = get_windows_device(device)?;
 
         let id_str_ptr = imm_device.GetId()?;
-        
-        // Ensure the ID string pointer returned is valid
         assert!(!id_str_ptr.is_null());
 
         let id_str = id_str_ptr.to_string()?;
