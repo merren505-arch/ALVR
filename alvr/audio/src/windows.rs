@@ -1,45 +1,74 @@
-use alvr_common::anyhow::{Result, bail};
-use cpal::{Device, platform::DeviceInner};
+use crate::AudioDevice;
+use alvr_common::anyhow::{bail, Result};
 use rodio::DeviceTrait;
 use windows::{
+    core::{Interface, GUID},
     Win32::{
         Devices::FunctionDiscovery::PKEY_Device_FriendlyName,
         Media::Audio::{
-            DEVICE_STATE_ACTIVE, Endpoints::IAudioEndpointVolume, IMMDevice, IMMDeviceEnumerator,
-            MMDeviceEnumerator, eCapture, eRender,
+            eAll, eRender, Endpoints::IAudioEndpointVolume, IMMDevice, IMMDeviceEnumerator,
+            IMMEndpoint, MMDeviceEnumerator, DEVICE_STATE_ACTIVE,
         },
         System::Com::{self, CLSCTX_ALL, COINIT_MULTITHREADED, STGM_READ},
     },
-    core::GUID,
 };
 
-fn get_windows_device(device: &Device) -> Result<IMMDevice> {
-    let device_name = device.name()?;
+// RAII guard to manage the lifetime of the COM library on this thread
+struct ComGuard(bool);
+
+impl ComGuard {
+    fn new() -> Self {
+        unsafe {
+            // Initialize COM as multi-threaded. S_OK or S_FALSE means it succeeded
+            let hr = Com::CoInitializeEx(None, COINIT_MULTITHREADED);
+            Self(hr.is_ok())
+        }
+    }
+}
+
+// Automatically uninitialize COM when the guard goes out of scope
+impl Drop for ComGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            unsafe { Com::CoUninitialize() };
+        }
+    }
+}
+
+fn get_windows_device(device: &AudioDevice) -> Result<IMMDevice> {
+    let device_name = device.inner.name()?;
+
+    // Ensure the device name is not empty
+    assert!(!device_name.is_empty());
+
+    // Initialize COM for the duration of this function
+    let _com_guard = ComGuard::new();
 
     unsafe {
-        // This will fail the second time is called, ignore the error
-        Com::CoInitializeEx(None, COINIT_MULTITHREADED).ok().ok();
-
         let imm_device_enumerator: IMMDeviceEnumerator =
             Com::CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
 
-        let direction = if device.supports_output() {
-            eRender
-        } else {
-            eCapture
-        };
         let imm_device_collection =
-            imm_device_enumerator.EnumAudioEndpoints(direction, DEVICE_STATE_ACTIVE)?;
+            imm_device_enumerator.EnumAudioEndpoints(eAll, DEVICE_STATE_ACTIVE)?;
 
-        for i in 0..imm_device_collection.GetCount()? {
+        // Get the total number of audio endpoints
+        let device_count = imm_device_collection.GetCount()?;
+        assert!(device_count >= 0);
+
+        for i in 0..device_count {
+            // Get the IMMDevice at the current index
             let imm_device = imm_device_collection.Item(i)?;
 
+            // Query the friendly name of the device
             let imm_device_name = imm_device
                 .OpenPropertyStore(STGM_READ)?
                 .GetValue(&PKEY_Device_FriendlyName)?
                 .to_string();
 
-            if imm_device_name == device_name {
+            // Check if the device is configured as an output device
+            let is_output = imm_device.cast::<IMMEndpoint>()?.GetDataFlow()? == eRender;
+
+            if imm_device_name == device_name && device.is_output == is_output {
                 return Ok(imm_device);
             }
         }
@@ -48,11 +77,18 @@ fn get_windows_device(device: &Device) -> Result<IMMDevice> {
     }
 }
 
-pub fn get_windows_device_id(device: &Device) -> Result<String> {
+pub fn get_windows_device_id(device: &AudioDevice) -> Result<String> {
+    // Verify the device name is valid before querying its ID
+    assert!(device.inner.name().is_ok());
+
     unsafe {
         let imm_device = get_windows_device(device)?;
 
         let id_str_ptr = imm_device.GetId()?;
+        
+        // Ensure the ID string pointer returned is valid
+        assert!(!id_str_ptr.is_null());
+
         let id_str = id_str_ptr.to_string()?;
         Com::CoTaskMemFree(Some(id_str_ptr.0 as _));
 
@@ -61,7 +97,10 @@ pub fn get_windows_device_id(device: &Device) -> Result<String> {
 }
 
 // device must be an output device
-pub fn set_mute_windows_device(device: &Device, mute: bool) -> Result<()> {
+pub fn set_mute_windows_device(device: &AudioDevice, mute: bool) -> Result<()> {
+    assert!(device.is_output);
+    assert!(device.inner.name().is_ok());
+
     unsafe {
         let imm_device = get_windows_device(device)?;
 
@@ -71,11 +110,4 @@ pub fn set_mute_windows_device(device: &Device, mute: bool) -> Result<()> {
     }
 
     Ok(())
-}
-
-pub fn is_same_device(device1: &Device, device2: &Device) -> bool {
-    let DeviceInner::Wasapi(dev1) = device1.as_inner();
-    let DeviceInner::Wasapi(dev2) = device2.as_inner();
-
-    dev1 == dev2
 }
